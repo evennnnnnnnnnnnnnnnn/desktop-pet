@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """A desktop pet that wanders randomly across your screen.
 
-Renders as a transparent, click-through Wayland layer-shell overlay covering one
-monitor. The pet is drawn inside that overlay, so walking is just moving a point
-on a canvas -- the compositor is never asked to reposition a window.
+Renders as a transparent Wayland layer-shell overlay covering one monitor. The
+pet is drawn inside that overlay, so walking is just moving a point on a canvas
+-- the compositor is never asked to reposition a window.
+
+The overlay's input region is kept clipped to the pet's own opaque pixels, so
+the pet reacts to the pointer while the rest of the screen stays click-through.
+Hovering the pet stops it; right-clicking opens a menu.
 """
 
 import argparse
@@ -22,6 +26,8 @@ gi.require_version("GtkLayerShell", "0.1")
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, GtkLayerShell  # noqa: E402
 
 TICK_MS = 16  # ~60fps
+ALPHA_CUTOFF = 8  # pixels this transparent are not part of the pet
+REGION_EPSILON = 3  # only resend the input region once it drifts this many px
 
 
 class Sprite:
@@ -47,6 +53,38 @@ class Sprite:
             )
         return self._cache[key]
 
+    def opaque_bounds(self, name="idle"):
+        """Tightest rect around the non-transparent pixels of `name`'s first frame.
+
+        Used as the pointer target so the transparent margin around the sprite
+        stays click-through.
+        """
+        pixbuf = self.frame(name, 0.0)
+        if not pixbuf.get_has_alpha():
+            return 0, 0, pixbuf.get_width(), pixbuf.get_height()
+
+        pixels = pixbuf.get_pixels()
+        stride = pixbuf.get_rowstride()
+        channels = pixbuf.get_n_channels()
+        width, height = pixbuf.get_width(), pixbuf.get_height()
+
+        min_x, min_y, max_x, max_y = width, height, -1, -1
+        for y in range(height):
+            row = y * stride
+            for x in range(width):
+                if pixels[row + x * channels + 3] > ALPHA_CUTOFF:
+                    if x < min_x:
+                        min_x = x
+                    if x > max_x:
+                        max_x = x
+                    if y < min_y:
+                        min_y = y
+                    if y > max_y:
+                        max_y = y
+        if max_x < 0:
+            return 0, 0, width, height
+        return min_x, min_y, max_x - min_x + 1, max_y - min_y + 1
+
 
 class Pet:
     """Random-walk state machine: pick a target, walk to it, pause, repeat."""
@@ -58,6 +96,7 @@ class Pet:
         self.x, self.y = self._random_point()
         self.facing = "right"
         self.walking = False
+        self.frozen = False
         self.pause_left = random.uniform(*dwell)
         self.target = (self.x, self.y)
         self.anim_time = 0.0
@@ -68,10 +107,18 @@ class Pet:
 
     @property
     def animation(self):
-        return f"walk-{self.facing}" if self.walking else "idle"
+        if self.frozen or not self.walking:
+            return "idle"
+        return f"walk-{self.facing}"
 
-    def update(self, dt):
+    def update(self, dt, frozen=False):
+        if frozen != self.frozen:
+            self.frozen = frozen  # restart the clock so the new animation starts at frame 0
+            self.anim_time = 0.0
         self.anim_time += dt
+
+        if frozen:
+            return  # held still under the pointer; keeps its target for later
 
         if not self.walking:
             self.pause_left -= dt
@@ -100,7 +147,7 @@ class Pet:
 
 
 def build_overlay(monitor, namespace):
-    """A fullscreen, transparent, click-through overlay pinned to `monitor`."""
+    """A fullscreen transparent overlay pinned to `monitor`."""
     win = Gtk.Window()
     win.set_app_paintable(True)
     visual = win.get_screen().get_rgba_visual()
@@ -117,18 +164,48 @@ def build_overlay(monitor, namespace):
         GtkLayerShell.set_anchor(win, edge, True)
     # -1 keeps the overlay from reserving space, so it never shifts other windows.
     GtkLayerShell.set_exclusive_zone(win, -1)
+    # ON_DEMAND lets the right-click menu take the keyboard while it is open
+    # without the idle overlay ever holding focus.
+    GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.ON_DEMAND)
     return win
 
 
-def make_click_through(win):
-    """Empty input region: pointer events fall through to whatever is beneath."""
-    win.input_shape_combine_region(cairo.Region())
+def build_menu(entries, parent, on_closed):
+    """The right-click menu: the configured launchers, then Quit."""
+    menu = Gtk.Menu()
+    # On Wayland the menu is an xdg_popup, which needs its parent surface --
+    # without this it silently fails to map on a layer-shell window.
+    menu.attach_to_widget(parent, None)
+
+    def launch(_item, command):
+        try:
+            GLib.spawn_command_line_async(command)
+        except GLib.Error as err:
+            print(f"could not launch {command!r}: {err.message}")
+
+    for entry in entries:
+        item = Gtk.MenuItem(label=entry["label"])
+        item.connect("activate", launch, entry["command"])
+        menu.append(item)
+
+    if entries:
+        menu.append(Gtk.SeparatorMenuItem())
+    quit_item = Gtk.MenuItem(label="Quit")
+    quit_item.connect("activate", lambda _i: Gtk.main_quit())
+    menu.append(quit_item)
+
+    menu.show_all()
+    menu.connect("deactivate", on_closed)
+    return menu
 
 
 def main():
+    here = Path(__file__).parent
     parser = argparse.ArgumentParser(description="A desktop pet that wanders your screen.")
-    parser.add_argument("--sprite", default=str(Path(__file__).parent / "assets" / "pet.json"),
+    parser.add_argument("--sprite", default=str(here / "assets" / "pet.json"),
                         help="path to the sprite manifest JSON")
+    parser.add_argument("--menu", default=str(here / "assets" / "menu.json"),
+                        help="path to the right-click menu JSON")
     parser.add_argument("--monitor", type=int, default=0, help="monitor index to live on")
     parser.add_argument("--scale", type=float, default=0.5, help="sprite scale factor")
     parser.add_argument("--speed", type=float, default=90.0, help="walking speed in px/sec")
@@ -154,9 +231,11 @@ def main():
     geo = monitor.get_geometry()
 
     sprite = Sprite(args.sprite)
+    menu_path = Path(args.menu)
+    entries = json.loads(menu_path.read_text()) if menu_path.exists() else []
+
     draw_w = sprite.w * args.scale
     draw_h = sprite.h * args.scale
-    # Roam over the area where the whole sprite still fits on screen.
     pet = Pet(
         bounds=(max(1.0, geo.width - draw_w), max(1.0, geo.height - draw_h)),
         speed=args.speed,
@@ -164,6 +243,47 @@ def main():
     )
 
     win = build_overlay(monitor, "desktop-pet")
+    win.add_events(
+        Gdk.EventMask.POINTER_MOTION_MASK
+        | Gdk.EventMask.BUTTON_PRESS_MASK
+        | Gdk.EventMask.ENTER_NOTIFY_MASK
+        | Gdk.EventMask.LEAVE_NOTIFY_MASK
+    )
+
+    # The pet is held still while the pointer is on it or its menu is open.
+    held = {"hover": False, "menu": False}
+
+    def on_menu_closed(_menu):
+        held["menu"] = False
+
+    menu = build_menu(entries, win, on_menu_closed)
+
+    win.connect("enter-notify-event", lambda *_: held.__setitem__("hover", True))
+    win.connect("leave-notify-event", lambda *_: held.__setitem__("hover", False))
+
+    def on_button_press(_widget, event):
+        if event.button == Gdk.BUTTON_SECONDARY:
+            held["menu"] = True
+            menu.popup_at_pointer(event)
+            return True
+        return False
+
+    win.connect("button-press-event", on_button_press)
+
+    # Pointer target: the sprite's opaque pixels, in overlay coordinates.
+    bx, by, bw, bh = sprite.opaque_bounds("idle")
+    hit_w = max(1, int(bw * args.scale))
+    hit_h = max(1, int(bh * args.scale))
+    last_region = [None]
+
+    def sync_input_region():
+        rect = (int(pet.x + bx * args.scale), int(pet.y + by * args.scale), hit_w, hit_h)
+        previous = last_region[0]
+        if previous and abs(rect[0] - previous[0]) < REGION_EPSILON and \
+                abs(rect[1] - previous[1]) < REGION_EPSILON:
+            return
+        last_region[0] = rect
+        win.input_shape_combine_region(cairo.Region(cairo.RectangleInt(*rect)))
 
     def on_draw(_widget, cr):
         cr.set_operator(cairo.OPERATOR_SOURCE)
@@ -181,10 +301,11 @@ def main():
     win.connect("draw", on_draw)
     win.connect("destroy", Gtk.main_quit)
     win.show_all()
-    make_click_through(win)
+    sync_input_region()
 
     def tick():
-        pet.update(TICK_MS / 1000.0)
+        pet.update(TICK_MS / 1000.0, frozen=held["hover"] or held["menu"])
+        sync_input_region()
         win.queue_draw()
         return GLib.SOURCE_CONTINUE
 

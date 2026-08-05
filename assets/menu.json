@@ -1,0 +1,6 @@
+[
+  { "label": "Terminal", "command": "kitty" },
+  { "label": "Browser", "command": "firefox" },
+  { "label": "Files", "command": "dolphin" },
+  { "label": "Editor", "command": "code" }
+]

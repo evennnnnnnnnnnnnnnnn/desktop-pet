@@ -2,10 +2,15 @@
 
 A sprite that wanders randomly around your desktop.
 
-Draws itself into a transparent, click-through **Wayland layer-shell overlay** covering
-one monitor. Walking is just moving a point on that canvas, so the compositor is never
-asked to reposition a window — which is what makes this work on compositors like
-Hyprland, Sway, and river, where clients cannot place their own windows.
+Draws itself into a transparent **Wayland layer-shell overlay** covering one monitor.
+Walking is just moving a point on that canvas, so the compositor is never asked to
+reposition a window — which is what makes this work on compositors like Hyprland, Sway,
+and river, where clients cannot place their own windows.
+
+- **Hover it and it stops.** It holds its target and carries on once you move away.
+- **Right-click it for a menu** of launchers, plus Quit.
+- Everything except the pet itself is click-through: the overlay's input region is kept
+  clipped to the sprite's own opaque pixels, so only a sprite-sized box swallows clicks.
 
 ## Requirements
 
@@ -26,6 +31,7 @@ sudo pacman -S --needed gtk-layer-shell python-gobject python-cairo
 | Flag | Default | Meaning |
 |---|---|---|
 | `--sprite` | `assets/pet.json` | sprite manifest to load |
+| `--menu` | `assets/menu.json` | right-click menu entries |
 | `--monitor` | `0` | which monitor the pet lives on |
 | `--scale` | `0.5` | sprite scale factor |
 | `--speed` | `90` | walking speed, px/sec |
@@ -38,6 +44,20 @@ Stop it with `Ctrl-C`.
 A two-state loop: pick a uniformly random point on the monitor, walk to it in a straight
 line at `--speed`, pause for a random interval in `--dwell`, repeat. The pet faces the
 direction it is travelling.
+
+## The right-click menu
+
+`assets/menu.json` is a list of launchers. A `Quit` item is always appended.
+
+```json
+[
+  { "label": "Terminal", "command": "kitty" },
+  { "label": "Browser",  "command": "firefox" }
+]
+```
+
+`command` is run directly, not through a shell, so it takes arguments but not pipes or
+globs. Delete the file for a menu with nothing but `Quit`.
 
 ## Using a different sprite
 
