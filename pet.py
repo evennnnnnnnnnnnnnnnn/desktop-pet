@@ -8,12 +8,19 @@ pet is drawn inside that overlay, so walking is just moving a point on a canvas
 The overlay's input region is kept clipped to the pet's own opaque pixels, so
 the pet reacts to the pointer while the rest of the screen stays click-through.
 Hovering the pet stops it; right-clicking opens a menu.
+
+The pet also doubles as an Orbh monitor. When an agent session anywhere on the
+machine blocks on a human, the pet walks to the nearest corner, waves, and
+shows a speech bubble naming the sessions; the right-click menu lists them and
+attaches on click. See orbh.py. That watch is optional -- if Blacksmith is not
+running, the pet just wanders.
 """
 
 import argparse
 import json
 import math
 import random
+import shlex
 from pathlib import Path
 
 import cairo
@@ -23,11 +30,31 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("GtkLayerShell", "0.1")
-from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, GtkLayerShell  # noqa: E402
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import (  # noqa: E402
+    Gdk, GdkPixbuf, GLib, Gtk, GtkLayerShell, Pango, PangoCairo,
+)
+
+import orbh  # noqa: E402
 
 TICK_MS = 16  # ~60fps
 ALPHA_CUTOFF = 8  # pixels this transparent are not part of the pet
 REGION_EPSILON = 3  # only resend the input region once it drifts this many px
+
+CORNER_MARGIN = 24  # how far from the screen edge the pet parks to raise a flag
+BUBBLE_PAD = 12
+BUBBLE_RADIUS = 10
+BUBBLE_GAP = 10  # between the bubble's tail and the pet's head
+BUBBLE_MAX_WIDTH = 420
+BUBBLE_MAX_ROWS = 5  # more than this and the rest collapse into a "+N more"
+BUBBLE_EDGE_MARGIN = 8  # keeps the bubble off the screen edge in a corner
+
+# Only an interactive session has a terminal to take over; anything else is
+# opened read-only on its Page, which is where a headless session says what it
+# is waiting for.
+DEFAULT_ATTACH = "kitty -e flint orbh attach {id} -p {path}"
+DEFAULT_INSPECT = "kitty --hold -e flint orbh page {id} -p {path}"
 
 
 class Sprite:
@@ -97,6 +124,7 @@ class Pet:
         self.facing = "right"
         self.walking = False
         self.frozen = False
+        self.summoned = False  # parked somewhere on purpose rather than wandering
         self.pause_left = random.uniform(*dwell)
         self.target = (self.x, self.y)
         self.anim_time = 0.0
@@ -105,11 +133,35 @@ class Pet:
         w, h = self.bounds
         return random.uniform(0, w), random.uniform(0, h)
 
+    def summon(self, point):
+        """Abandon the wander, walk to `point`, and stay there waving."""
+        if self.summoned and self.target == point:
+            return  # already on the way; don't restart the animation
+        self.summoned = True
+        self.target = point
+        self.walking = True
+        self.anim_time = 0.0
+
+    def release(self):
+        """Go back to wandering."""
+        if not self.summoned:
+            return
+        self.summoned = False
+        self.walking = False
+        self.pause_left = random.uniform(*self.dwell)
+        self.anim_time = 0.0
+
+    @property
+    def arrived(self):
+        return self.summoned and not self.walking
+
     @property
     def animation(self):
-        if self.frozen or not self.walking:
+        if self.frozen:
             return "idle"
-        return f"walk-{self.facing}"
+        if self.walking:
+            return f"walk-{self.facing}"
+        return "wave" if self.summoned else "idle"
 
     def update(self, dt, frozen=False):
         if frozen != self.frozen:
@@ -121,6 +173,8 @@ class Pet:
             return  # held still under the pointer; keeps its target for later
 
         if not self.walking:
+            if self.summoned:
+                return  # parked at the corner until whatever summoned it clears
             self.pause_left -= dt
             if self.pause_left <= 0:
                 self.target = self._random_point()
@@ -170,8 +224,81 @@ def build_overlay(monitor, namespace):
     return win
 
 
-def build_menu(entries, parent, on_closed):
-    """The right-click menu: the configured launchers, then Quit."""
+def _rounded_rect(cr, x, y, width, height, radius):
+    cr.new_sub_path()
+    cr.arc(x + width - radius, y + radius, radius, -math.pi / 2, 0)
+    cr.arc(x + width - radius, y + height - radius, radius, 0, math.pi / 2)
+    cr.arc(x + radius, y + height - radius, radius, math.pi / 2, math.pi)
+    cr.arc(x + radius, y + radius, radius, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def draw_bubble(cr, markup, anchor_x, anchor_y, bounds):
+    """A speech bubble whose tail points at (anchor_x, anchor_y).
+
+    Sits above the anchor when there is room and flips below when there isn't,
+    so the pet can raise it from any corner.
+    """
+    layout = PangoCairo.create_layout(cr)
+    layout.set_font_description(Pango.FontDescription("Sans 10"))
+    layout.set_width(BUBBLE_MAX_WIDTH * Pango.SCALE)
+    layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+    layout.set_markup(markup, -1)
+    text_w, text_h = (size / Pango.SCALE for size in layout.get_size())
+
+    width = text_w + BUBBLE_PAD * 2
+    height = text_h + BUBBLE_PAD * 2
+    screen_w, screen_h = bounds
+
+    above = anchor_y - BUBBLE_GAP - height >= BUBBLE_EDGE_MARGIN
+    y = anchor_y - BUBBLE_GAP - height if above else anchor_y + BUBBLE_GAP
+    limit_x = max(BUBBLE_EDGE_MARGIN, screen_w - width - BUBBLE_EDGE_MARGIN)
+    limit_y = max(BUBBLE_EDGE_MARGIN, screen_h - height - BUBBLE_EDGE_MARGIN)
+    x = max(BUBBLE_EDGE_MARGIN, min(anchor_x - width / 2, limit_x))
+    y = max(BUBBLE_EDGE_MARGIN, min(y, limit_y))
+
+    cr.save()
+    _rounded_rect(cr, x, y, width, height, BUBBLE_RADIUS)
+    # The tail is part of the same path, so the fill and the outline meet
+    # cleanly instead of showing a seam where the triangle joins the body.
+    tail_y = y + height if above else y
+    tail_dir = 1 if above else -1
+    tip_x = max(x + BUBBLE_RADIUS + 12, min(anchor_x, x + width - BUBBLE_RADIUS - 12))
+    cr.move_to(tip_x - 9, tail_y)
+    cr.line_to(tip_x, tail_y + BUBBLE_GAP * tail_dir)
+    cr.line_to(tip_x + 9, tail_y)
+    cr.close_path()
+
+    cr.set_source_rgba(0.09, 0.10, 0.13, 0.94)
+    cr.fill_preserve()
+    cr.set_source_rgba(0.98, 0.76, 0.22, 0.85)
+    cr.set_line_width(1.5)
+    cr.stroke()
+
+    cr.set_source_rgba(0.95, 0.95, 0.96, 1.0)
+    cr.move_to(x + BUBBLE_PAD, y + BUBBLE_PAD)
+    PangoCairo.show_layout(cr, layout)
+    cr.restore()
+
+
+def bubble_markup(sessions):
+    """The bubble's contents: a headline, then one line per session."""
+    count = len(sessions)
+    noun = "session needs" if count == 1 else "sessions need"
+    lines = [f"<b>{count} {noun} you</b>"]
+    for session in sessions[:BUBBLE_MAX_ROWS]:
+        lines.append(f"• {GLib.markup_escape_text(session.label)}")
+    remaining = count - BUBBLE_MAX_ROWS
+    if remaining > 0:
+        lines.append(f"<i>+{remaining} more</i>")
+    return "\n".join(lines)
+
+
+def build_menu(entries, sessions, parent, attach_command, on_closed):
+    """The right-click menu: live sessions, the configured launchers, then Quit.
+
+    Rebuilt on every click so the session list is never stale.
+    """
     menu = Gtk.Menu()
     # On Wayland the menu is an xdg_popup, which needs its parent surface --
     # without this it silently fails to map on a layer-shell window.
@@ -182,6 +309,23 @@ def build_menu(entries, parent, on_closed):
             GLib.spawn_command_line_async(command)
         except GLib.Error as err:
             print(f"could not launch {command!r}: {err.message}")
+
+    for session in sessions:
+        marker = "●" if session.needs_input else "○"
+        label = f"{marker}  {GLib.markup_escape_text(session.label)}"
+        if session.needs_input:
+            label += "   <b>needs input</b>"
+        item = Gtk.MenuItem(label="")
+        item.get_child().set_markup(label)
+        item.set_tooltip_text(
+            f"Attach to this session ({session.runtime})" if session.attachable
+            else f"Show this session's Page ({session.mode or 'headless'} "
+                 f"sessions have no terminal to attach to)"
+        )
+        item.connect("activate", launch, attach_command(session))
+        menu.append(item)
+    if sessions:
+        menu.append(Gtk.SeparatorMenuItem())
 
     for entry in entries:
         item = Gtk.MenuItem(label=entry["label"])
@@ -212,6 +356,14 @@ def main():
     parser.add_argument("--dwell", type=float, nargs=2, default=(1.5, 6.0),
                         metavar=("MIN", "MAX"), help="seconds to pause between walks")
     parser.add_argument("--list-monitors", action="store_true", help="list monitors and exit")
+    parser.add_argument("--no-orbh", action="store_true",
+                        help="do not watch Orbh agent sessions")
+    parser.add_argument("--attach-command", default=DEFAULT_ATTACH,
+                        help="command run when an interactive session is picked from "
+                             "the menu; {id}, {path} and {title} are substituted")
+    parser.add_argument("--inspect-command", default=DEFAULT_INSPECT,
+                        help="as --attach-command, but for sessions with no terminal "
+                             "to attach to (headless and subagent sessions)")
     args = parser.parse_args()
 
     display = Gdk.Display.get_default()
@@ -252,11 +404,21 @@ def main():
 
     # The pet is held still while the pointer is on it or its menu is open.
     held = {"hover": False, "menu": False}
+    # Everything the Orbh watch feeds in. Replaced wholesale on each update.
+    watch = {"sessions": [], "alerts": []}
+    # The open menu has to outlive this scope or it is collected while mapped.
+    menu_ref = {"menu": None}
 
     def on_menu_closed(_menu):
         held["menu"] = False
 
-    menu = build_menu(entries, win, on_menu_closed)
+    def attach_command(session):
+        template = args.attach_command if session.attachable else args.inspect_command
+        return template.format(
+            id=shlex.quote(session.id),
+            path=shlex.quote(session.flint_path),
+            title=shlex.quote(session.title),
+        )
 
     win.connect("enter-notify-event", lambda *_: held.__setitem__("hover", True))
     win.connect("leave-notify-event", lambda *_: held.__setitem__("hover", False))
@@ -264,7 +426,11 @@ def main():
     def on_button_press(_widget, event):
         if event.button == Gdk.BUTTON_SECONDARY:
             held["menu"] = True
-            menu.popup_at_pointer(event)
+            # Rebuilt per click so the session list reflects the live roster.
+            menu_ref["menu"] = build_menu(
+                entries, watch["sessions"], win, attach_command, on_menu_closed
+            )
+            menu_ref["menu"].popup_at_pointer(event)
             return True
         return False
 
@@ -296,6 +462,17 @@ def main():
         Gdk.cairo_set_source_pixbuf(cr, sprite.frame(pet.animation, pet.anim_time), 0, 0)
         cr.paint()
         cr.restore()
+
+        # Raised only once the pet has actually reached its corner, so the
+        # bubble doesn't drag across the screen behind it.
+        if watch["alerts"] and pet.arrived:
+            draw_bubble(
+                cr,
+                bubble_markup(watch["alerts"]),
+                pet.x + (bx + bw / 2) * args.scale,
+                pet.y + by * args.scale,
+                (geo.width, geo.height),
+            )
         return False
 
     win.connect("draw", on_draw)
@@ -303,14 +480,50 @@ def main():
     win.show_all()
     sync_input_region()
 
+    def nearest_corner():
+        """The corner of the roaming area closest to where the pet stands."""
+        span_w, span_h = pet.bounds
+        x = CORNER_MARGIN if pet.x < span_w / 2 else max(CORNER_MARGIN, span_w - CORNER_MARGIN)
+        y = CORNER_MARGIN if pet.y < span_h / 2 else max(CORNER_MARGIN, span_h - CORNER_MARGIN)
+        return x, y
+
+    alerting = [False]
+
     def tick():
+        # Only act on the edges, so the pet keeps walking to the corner it
+        # first chose instead of re-picking the nearest one as it moves.
+        raised = bool(watch["alerts"])
+        if raised and not alerting[0]:
+            pet.summon(nearest_corner())
+        elif not raised and alerting[0]:
+            pet.release()
+        alerting[0] = raised
+
         pet.update(TICK_MS / 1000.0, frozen=held["hover"] or held["menu"])
         sync_input_region()
         win.queue_draw()
         return GLib.SOURCE_CONTINUE
 
+    monitor = None
+    if not args.no_orbh:
+        def apply_sessions(sessions):
+            watch["sessions"] = sessions
+            watch["alerts"] = [s for s in sessions if s.needs_input]
+            win.queue_draw()
+            return GLib.SOURCE_REMOVE
+
+        # The monitor reports from its own threads; hop to the GTK loop first.
+        monitor = orbh.OrbhMonitor(
+            lambda sessions: GLib.idle_add(apply_sessions, sessions)
+        )
+        monitor.start()
+
     GLib.timeout_add(TICK_MS, tick)
-    Gtk.main()
+    try:
+        Gtk.main()
+    finally:
+        if monitor:
+            monitor.stop()
 
 
 if __name__ == "__main__":
