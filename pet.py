@@ -285,10 +285,14 @@ def draw_bubble(cr, markup, anchor_x, anchor_top, anchor_bottom, bounds):
 
 
 def session_marker(session):
-    """● blocking on you, ◌ stopped and unadjudicated, ○ genuinely running."""
-    if session.needs_input:
-        return "●"
-    return "◌" if session.stopped else "○"
+    """Filled when the session wants a human, hollow while it is just running.
+
+    A stopped-and-unadjudicated session is filled too: Orbh may resolve it on
+    its own within seconds, but it may also be one of the cases nothing ever
+    resolves, and either way nothing is progressing. The trailing text is what
+    separates it from a session actually blocked on a question.
+    """
+    return "●" if (session.needs_input or session.stopped) else "○"
 
 
 def bubble_markup(sessions):

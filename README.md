@@ -91,15 +91,17 @@ hundreds of finished sessions that can never want anything.
 
 Any of them sends the pet to a corner, so it is parked whenever agents are running and
 wanders only when they are all done. The bubble leads with whatever is blocking on you
-(`●`, bold) and falls back to a count of what is merely running (`○`). Waiting sessions
-sort first, so they are never the rows dropped when the list overflows.
+(`●`, bold) and falls back to a count of what is merely running (`○`). Sessions that
+want a human sort first, so they are never the rows dropped when the list overflows.
 
-A third marker, `◌`, means the agent has stopped but Orbh has not ruled on it yet.
-When a run ends without returning, Orbh deliberately holds the session at `working`
-until its reaper decides whether to re-prompt or park it, so a stopped agent and a busy
-one report the same work state — and headless runs carry no busy/idle signal to tell
-them apart. Orbh flags the window as `presentation.pendingVerdict`, which is what the
-pet reads rather than trying to infer it. Normally it resolves within about 15 seconds.
+A session that has stopped without being ruled on is filled (`●`) too, and labelled
+*stopped, awaiting verdict*. When a run ends without returning, Orbh deliberately holds
+the session at `working` until its reaper decides whether to re-prompt or park it, so a
+stopped agent and a busy one report the same work state — and headless runs carry no
+busy/idle signal to tell them apart. Orbh flags the window as
+`presentation.pendingVerdict`, which is what the pet reads rather than trying to infer
+it. It usually resolves within about 15 seconds, but not always: a run killed by
+`SIGHUP` ends with a reason the reaper does not adjudicate, and stays there.
 
 Everything here fails soft. If Blacksmith isn't running, or a server dies, or the schema
 moves, the pet reports nothing and keeps wandering. Pass `--no-orbh` to switch it off.
