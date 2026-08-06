@@ -9,8 +9,9 @@ and river, where clients cannot place their own windows.
 
 - **Hover it and it stops.** It holds its target and carries on once you move away.
 - **Right-click it for a menu** of launchers, plus Quit.
-- **It watches your agents.** If an [Orbh](#watching-orbh-sessions) session anywhere on the
-  machine blocks on you, the pet walks to the nearest corner, waves, and says which one.
+- **It watches your agents.** While any [Orbh](#watching-orbh-sessions) session on the
+  machine is live, the pet walks to the nearest corner, waves, and lists them — the ones
+  blocking on you first, in bold.
 - Everything except the pet itself is click-through: the overlay's input region is kept
   clipped to the sprite's own opaque pixels, so only a sprite-sized box swallows clicks.
 
@@ -87,6 +88,11 @@ respawns servers — so it re-runs discovery every 30s and whenever a stream dro
 Only `working` and `needs-input` sessions are ever shown. `awaiting` is deliberately
 excluded: it means dormant-but-auto-wakeable, which needs no human, and a Flint can hold
 hundreds of finished sessions that can never want anything.
+
+Any of them sends the pet to a corner, so it is parked whenever agents are running and
+wanders only when they are all done. The bubble leads with whatever is blocking on you
+(`●`, bold) and falls back to a count of what is merely running (`○`). Waiting sessions
+sort first, so they are never the rows dropped when the list overflows.
 
 Everything here fails soft. If Blacksmith isn't running, or a server dies, or the schema
 moves, the pet reports nothing and keeps wandering. Pass `--no-orbh` to switch it off.

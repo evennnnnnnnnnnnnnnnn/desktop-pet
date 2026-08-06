@@ -233,11 +233,13 @@ def _rounded_rect(cr, x, y, width, height, radius):
     cr.close_path()
 
 
-def draw_bubble(cr, markup, anchor_x, anchor_y, bounds):
-    """A speech bubble whose tail points at (anchor_x, anchor_y).
+def draw_bubble(cr, markup, anchor_x, anchor_top, anchor_bottom, bounds):
+    """A speech bubble tethered to the sprite spanning anchor_top..anchor_bottom.
 
-    Sits above the anchor when there is room and flips below when there isn't,
-    so the pet can raise it from any corner.
+    Sits above the sprite when there is room and flips below when there isn't,
+    so the pet can raise it from any corner. The two anchors are what keep the
+    flipped bubble clear of the pet: pointing both cases at the same edge would
+    drop the bubble straight over it.
     """
     layout = PangoCairo.create_layout(cr)
     layout.set_font_description(Pango.FontDescription("Sans 10"))
@@ -250,7 +252,8 @@ def draw_bubble(cr, markup, anchor_x, anchor_y, bounds):
     height = text_h + BUBBLE_PAD * 2
     screen_w, screen_h = bounds
 
-    above = anchor_y - BUBBLE_GAP - height >= BUBBLE_EDGE_MARGIN
+    above = anchor_top - BUBBLE_GAP - height >= BUBBLE_EDGE_MARGIN
+    anchor_y = anchor_top if above else anchor_bottom
     y = anchor_y - BUBBLE_GAP - height if above else anchor_y + BUBBLE_GAP
     limit_x = max(BUBBLE_EDGE_MARGIN, screen_w - width - BUBBLE_EDGE_MARGIN)
     limit_y = max(BUBBLE_EDGE_MARGIN, screen_h - height - BUBBLE_EDGE_MARGIN)
@@ -282,13 +285,26 @@ def draw_bubble(cr, markup, anchor_x, anchor_y, bounds):
 
 
 def bubble_markup(sessions):
-    """The bubble's contents: a headline, then one line per session."""
-    count = len(sessions)
-    noun = "session needs" if count == 1 else "sessions need"
-    lines = [f"<b>{count} {noun} you</b>"]
+    """The bubble's contents: a headline, then one line per session.
+
+    Leads with whatever is waiting on the human, falling back to a plain count
+    of what is merely running. Sessions arrive sorted with the waiting ones
+    first, so those are never the rows that get truncated.
+    """
+    waiting = [session for session in sessions if session.needs_input]
+    if waiting:
+        noun = "session needs" if len(waiting) == 1 else "sessions need"
+        headline = f"{len(waiting)} {noun} you"
+    else:
+        noun = "session" if len(sessions) == 1 else "sessions"
+        headline = f"{len(sessions)} live {noun}"
+
+    lines = [f"<b>{headline}</b>"]
     for session in sessions[:BUBBLE_MAX_ROWS]:
-        lines.append(f"• {GLib.markup_escape_text(session.label)}")
-    remaining = count - BUBBLE_MAX_ROWS
+        marker = "●" if session.needs_input else "○"
+        label = GLib.markup_escape_text(session.label)
+        lines.append(f"{marker} <b>{label}</b>" if session.needs_input else f"{marker} {label}")
+    remaining = len(sessions) - BUBBLE_MAX_ROWS
     if remaining > 0:
         lines.append(f"<i>+{remaining} more</i>")
     return "\n".join(lines)
@@ -404,8 +420,9 @@ def main():
 
     # The pet is held still while the pointer is on it or its menu is open.
     held = {"hover": False, "menu": False}
-    # Everything the Orbh watch feeds in. Replaced wholesale on each update.
-    watch = {"sessions": [], "alerts": []}
+    # Every live session the Orbh watch reports, waiting ones first. Replaced
+    # wholesale on each update; any entry at all sends the pet to a corner.
+    watch = {"sessions": []}
     # The open menu has to outlive this scope or it is collected while mapped.
     menu_ref = {"menu": None}
 
@@ -465,12 +482,13 @@ def main():
 
         # Raised only once the pet has actually reached its corner, so the
         # bubble doesn't drag across the screen behind it.
-        if watch["alerts"] and pet.arrived:
+        if watch["sessions"] and pet.arrived:
             draw_bubble(
                 cr,
-                bubble_markup(watch["alerts"]),
+                bubble_markup(watch["sessions"]),
                 pet.x + (bx + bw / 2) * args.scale,
                 pet.y + by * args.scale,
+                pet.y + (by + bh) * args.scale,
                 (geo.width, geo.height),
             )
         return False
@@ -487,17 +505,18 @@ def main():
         y = CORNER_MARGIN if pet.y < span_h / 2 else max(CORNER_MARGIN, span_h - CORNER_MARGIN)
         return x, y
 
-    alerting = [False]
+    flagging = [False]
 
     def tick():
         # Only act on the edges, so the pet keeps walking to the corner it
-        # first chose instead of re-picking the nearest one as it moves.
-        raised = bool(watch["alerts"])
-        if raised and not alerting[0]:
+        # first chose instead of re-picking the nearest one as it moves, and
+        # stays put while sessions come and go underneath it.
+        raised = bool(watch["sessions"])
+        if raised and not flagging[0]:
             pet.summon(nearest_corner())
-        elif not raised and alerting[0]:
+        elif not raised and flagging[0]:
             pet.release()
-        alerting[0] = raised
+        flagging[0] = raised
 
         pet.update(TICK_MS / 1000.0, frozen=held["hover"] or held["menu"])
         sync_input_region()
@@ -508,7 +527,6 @@ def main():
     if not args.no_orbh:
         def apply_sessions(sessions):
             watch["sessions"] = sessions
-            watch["alerts"] = [s for s in sessions if s.needs_input]
             win.queue_draw()
             return GLib.SOURCE_REMOVE
 
