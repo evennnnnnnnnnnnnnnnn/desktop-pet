@@ -284,6 +284,13 @@ def draw_bubble(cr, markup, anchor_x, anchor_top, anchor_bottom, bounds):
     cr.restore()
 
 
+def session_marker(session):
+    """● blocking on you, ◌ stopped and unadjudicated, ○ genuinely running."""
+    if session.needs_input:
+        return "●"
+    return "◌" if session.stopped else "○"
+
+
 def bubble_markup(sessions):
     """The bubble's contents: a headline, then one line per session.
 
@@ -301,9 +308,13 @@ def bubble_markup(sessions):
 
     lines = [f"<b>{headline}</b>"]
     for session in sessions[:BUBBLE_MAX_ROWS]:
-        marker = "●" if session.needs_input else "○"
+        marker = session_marker(session)
         label = GLib.markup_escape_text(session.label)
         lines.append(f"{marker} <b>{label}</b>" if session.needs_input else f"{marker} {label}")
+        if session.stopped:
+            # Orbh still calls this "working"; say what it actually means so a
+            # stopped agent doesn't read as a busy one.
+            lines.append("<span alpha='60%'><i>    stopped, awaiting verdict</i></span>")
     remaining = len(sessions) - BUBBLE_MAX_ROWS
     if remaining > 0:
         lines.append(f"<i>+{remaining} more</i>")
@@ -327,10 +338,11 @@ def build_menu(entries, sessions, parent, attach_command, on_closed):
             print(f"could not launch {command!r}: {err.message}")
 
     for session in sessions:
-        marker = "●" if session.needs_input else "○"
-        label = f"{marker}  {GLib.markup_escape_text(session.label)}"
+        label = f"{session_marker(session)}  {GLib.markup_escape_text(session.label)}"
         if session.needs_input:
             label += "   <b>needs input</b>"
+        elif session.stopped:
+            label += "   <span alpha='60%'><i>stopped, awaiting verdict</i></span>"
         item = Gtk.MenuItem(label="")
         item.get_child().set_markup(label)
         item.set_tooltip_text(

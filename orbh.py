@@ -52,10 +52,29 @@ class Session:
         self.flint_path = flint_path
         request = payload.get("pendingRequest") or {}
         self.question = request.get("question") or ""
+        # Orbh deliberately holds a session at "working" when its run ended
+        # without returning, until the reaper rules on it. This flag is how it
+        # says so, and without it a stopped agent is indistinguishable from a
+        # busy one -- headless runs carry no busy/idle signal at all.
+        self.pending_verdict = bool(
+            (payload.get("presentation") or {}).get("pendingVerdict")
+        )
 
     @property
     def needs_input(self):
         return self.work_state == NEEDS_INPUT
+
+    @property
+    def stopped(self):
+        """Run is over; Orbh has not yet decided whether to retry or park it."""
+        return self.pending_verdict and not self.needs_input
+
+    @property
+    def rank(self):
+        """Sort order: blocking on a human, then busy, then merely stopped."""
+        if self.needs_input:
+            return 0
+        return 2 if self.stopped else 1
 
     @property
     def attachable(self):
@@ -210,10 +229,10 @@ class OrbhMonitor:
         self._stop.set()
 
     def sessions(self):
-        """Every known session, needs-input first, then by label."""
+        """Every known session, most in need of a human first, then by label."""
         with self._lock:
             everything = [s for group in self._by_port.values() for s in group]
-        everything.sort(key=lambda s: (not s.needs_input, s.label.lower()))
+        everything.sort(key=lambda s: (s.rank, s.label.lower()))
         return everything
 
     def needs_input(self):
@@ -227,7 +246,7 @@ class OrbhMonitor:
     def _emit(self):
         """Notify the caller, but only when something actually changed."""
         current = self.sessions()
-        signature = tuple((s.id, s.work_state, s.label) for s in current)
+        signature = tuple((s.id, s.work_state, s.pending_verdict, s.label) for s in current)
         if signature == self._last_signature:
             return
         self._last_signature = signature
